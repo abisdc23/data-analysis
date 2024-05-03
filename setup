@@ -1,0 +1,28 @@
+[2:58 PM] DELA CRUZ Abigail (CNH)
+import setuptools
+ 
+with open("README.md", "r", encoding="utf-8") as fh:
+    long_description = fh.read()
+with open("requirements.txt", "r", encoding="utf-8") as fh:
+    requirements = fh.read().split()
+ 
+__version__ = '0.0.0'  # DON'T CHANGE HERE, see version.py to update version
+with open("dataops_postprocessing/version.py", "r", encoding="utf-8") as fh:
+    exec(fh.read())  # Overwrite __version__ with the value from version.py
+ 
+setuptools.setup(
+    name='dataops_postprocessing',
+    version=__version__,
+    author='Alex Zhang',
+    author_email='chengxian.zhang@cnhind.com',
+    description='The DataOps Post-processing package contains classes and methods for DataOps specific processing and analysis',
+    long_description=long_description,
+    long_description_content_type="text/markdown",
+    url='https://dev.azure.com/cnhi/Kringle/_git/dataops_postprocessing',
+    project_urls = {
+        "Team Board": "https://dev.azure.com/cnhi/Kringle/_boards/board/t/DataOps/Stories"
+    },
+    license='MIT',
+    packages=setuptools.find_packages(),
+    install_requires=requirements,
+)        
