@@ -1,0 +1,15 @@
+h5py>=3,<4
+pandas>=2,<3
+pyproj>=3,<4
+scipy>=1,<2
+shapely>=2,<3
+tables>=3,<4
+pint>=0,<1
+matplotlib>=3,<4
+python-docx>=1,<2
+kaleido>=0,<1
+cnhi_geotemporal>=0.1.0.11,<1
+cnhi_visualization>=0.7.0.0,<1
+cnhi_logging>=0.3,<1
+cnhi_products>=0.4.0.4,<1
+cnhi_metrics<1
