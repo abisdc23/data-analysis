@@ -1,0 +1,126 @@
+""""Functions to make report style more consistent"""
+ 
+# Python
+from io import StringIO
+from typing import Union
+import datetime
+import pandas as pd
+ 
+# CNHI
+from cnhi_logging import get_logger
+import cnhi_visualization.bokeh as cb
+from cnhi_visualization.plotly.layout import PlotlyLayout
+from cnhi_db.connectors.kringle_datalake import KringleDatalake
+ 
+ 
+LOGGER = get_logger(__name__)
+ 
+ 
+def initiate_BokehLayout(title: str, data_sources: str = 'Unknown') -> cb.BokehLayout:
+    """Initiate a BokehLayout object and add standardized title and subtitle
+ 
+    Args:
+        title: report title, e.g. AEORT Analysis
+        data_sources: CANData, LogCat, CPULog, etc
+ 
+    Returns:
+        A BokehLayout with title and subtitle
+    """
+    today = pd.to_datetime("today").date()
+    today = today.strftime("%a, %d %b, %Y")
+    bl = cb.BokehLayout()
+    bl.add_description(f"<h1>{title}</h1>")
+    bl.add_description(
+        "<h3>Report prepared by DataOps team of Precision Technology Product Validation - "
+        f"Customer Success on {today}. Data sources: {data_sources}.</h3>"
+    )
+ 
+    return bl
+ 
+ 
+def get_filename(analysis_name: str, start_time: pd.Timestamp) -> str:
+    """Get a standardized filename consisting of analysis name and data collection start time
+ 
+    Args:
+        analysis_name: name of the analysis, e.g. aeort_analysis
+        start_time: start time of data collection
+ 
+    Returns:
+        filename consisting of analysis name and data collection start time
+    """
+    data_collection_year = str(start_time.year)
+    data_collection_month = str(start_time.month).zfill(2)
+    data_collection_day = str(start_time.day).zfill(2)
+    data_collection_hour = str(start_time.hour).zfill(2)
+    data_collection_minute = str(start_time.minute).zfill(2)
+    data_collection_second = str(start_time.second).zfill(2)
+    data_collection_start_time = (
+        data_collection_year
+        + data_collection_month
+        + data_collection_day
+        + data_collection_hour
+        + data_collection_minute
+        + data_collection_second
+    )
+    filename = f"{analysis_name}_{data_collection_start_time}"
+ 
+    return filename
+ 
+ 
+def get_table_max_height(df):
+    """Get the Maximal Height of a BokehTable"""
+    height = min(600, 26 * (df.shape[0] + 1))
+ 
+    return height
+ 
+ 
+def get_bar_chart_min_height(y_range: Union[list, pd.Series, pd.DataFrame]) -> float:
+    """Get the Minimal Height of a Bar Chart"""
+    height = max(200, 80 * (len(y_range) + 1))
+ 
+    return height
+ 
+ 
+def upload_report_to_container(
+    layout: Union[cb.BokehLayout, PlotlyLayout],
+    filename: str,
+    timestamp: Union[pd.Timestamp, datetime.datetime],
+    container: str,
+    kdl: KringleDatalake = None,
+):
+    """Save HTML report to Azure blob container
+ 
+    Args:
+        layout: BokehLayout or PlotlyLayout containing the tables and visualizations
+        filename: folder path and filename of the report, e.g. AG_HTML_Report/ag_report.html
+        timestamp: start datetime of the report data
+        container: Azure blob container where the report is saved to
+        kdl: Kringe Datalake connector
+    """
+    # KringleDatalake
+    if not kdl:
+        kdl = KringleDatalake()
+        kdl.connect()
+ 
+    # Filename
+    filename = get_filename(filename, timestamp)
+    file_path = f"{filename}.html"
+ 
+    # Report
+    if isinstance(layout, cb.BokehLayout):
+        report = layout.get_html(file_path)
+    elif isinstance(layout, PlotlyLayout):
+        report = layout.to_html()
+    else:
+        raise RuntimeError(
+            f"BokehLayout and PlotlyLayout are expected, but {type(layout)} is given."
+        )
+    file_data = StringIO(report)
+ 
+    # Upload report
+    LOGGER.info(f"Saving the report to {container}/{file_path}.")
+    kdl.upload_data_to_container(
+        container=container, file_path=file_path, file_data=file_data
+    )
+    LOGGER.info(f"The report is successfully saved to {container}/{file_path}.")
+ 
