@@ -1,0 +1,1638 @@
+"""Crushed Crop Analysis
+
+This module generates an HTML report to assess the amount of 
+crop crushed by vehicle tires
+
+Attributes:
+    LOGGER: python logging object
+    message_list: list of CAN messages used for analysis
+"""
+
+# Python
+from pathlib import Path
+import pandas as pd
+import numpy as np
+from scipy import stats
+import pint
+
+# Shapely and pyproj
+from shapely.geometry import Polygon, MultiPolygon
+from shapely.ops import unary_union
+from pyproj import Geod
+
+# CNH
+from cnhi_data.data_elements.can_data import CANData
+from cnhi_data.data_transformations import Standardizer
+import dataops_postprocessing.report as rt
+import dataops_postprocessing.visualizations.trajectory as tj
+from cnhi_visualization.bokeh.base import add_patch
+from cnhi_logging import get_logger
+import cnhi_visualization.bokeh as cb
+from cnhi_products import get_vehicle
+from cnhi_products.vehicle import (
+    get_filtered_polygons,
+    get_slot_id,
+)
+from cnhi_geotemporal.utils import coordinates_to_address
+from cnhi_geotemporal.geospatial_offset import (
+    GeospatialOffset,
+    apply_geospatial_offset,
+    chain_geospatial_offsets,
+)
+
+
+LOGGER = get_logger(__name__)
+
+class CrushedCrop:
+    """Class for performing post-processing crushed crop analysis"""
+
+    def execute(
+        self,
+        cd: CANData,
+        tire_width: int,
+        tread_width: int,
+        xte_allowance: int,
+        height_offset: int,
+        wheelbase: int = None,
+        slot_id: int = None,
+        product_model: str = None,
+        z: int = 5,
+        bl: cb.BokehLayout = None,
+    ) -> Path:
+        """Execute crushed crop analysis
+
+        Args:
+            can_uuid (str): UUID that contains the preprocessed CAN data object.
+            tire_width (int): Sprayer tire width in mm
+            tread_width (int): Sprayer tread width in mm
+            xte_allowance (int): the amount of cross track error allowance the tire has in cm
+            wheelbase (int): Sprayer wheelbase in mm
+            height_offset (int): Sprayer antenna height offset in m
+            slot_id (int): Vehicle slot ID
+            product_model (str): Product model of the sprayer
+            z (int): the amount of standard deviations away the data is from the mean
+                        which we are willing to accept
+        """
+        self.z = z
+        self.tire_width = tire_width  # mm
+        self.tread_width = tread_width  # mm
+        self.xte_allowance = xte_allowance  # cm
+        self.wheelbase = wheelbase  # mm
+        self.height_offset = height_offset  # mm
+        self.slot_id = slot_id
+        self.bl = bl
+        LOGGER.info("Loading the data in")
+        self.cd = cd
+        if not self.slot_id:
+            self.slot_id = get_slot_id(self.cd)
+        self.vehicle = None
+        if type(slot_id) == int:
+            self.vehicle = get_vehicle(slot_id)
+            self.wheelbase = self.vehicle.steering.wheelbase.y
+        self.product_model = " ".join([s.capitalize() for s in product_model.split("_")])
+        LOGGER.info(f"Slot ID: {self.slot_id}.")
+        LOGGER.info("Cleaning dataframe")
+        self.analysis_df = self._clean_data_frame(cd)
+        if len(self.analysis_df) > 0:
+            self._get_engagement_dfs()
+            (
+                self.settled_area,
+                self.unsettled_area,
+                self.settled_crush_area,
+                self.total_tire_area,
+            ) = self._generate_visualizations()
+            self.bl = self._save_to_html()
+            LOGGER.info("Finished crushed crop analysis")
+        else:
+            LOGGER.info("No report added")
+            self.bl = None
+
+        return self.bl
+
+    def _clean_data_frame(self, cd):
+        """Interpolates and fills DataFrame columns"""
+        standardizer = Standardizer(sources={'CANData':cd}, wheel_base=self.wheelbase)
+        xte_m = standardizer.CrossTrackErrorMeter.get_signal()
+        LOGGER.info(f"XTE: {xte_m}")
+        velocity_mps = standardizer.VelocityMPS.get_signal()
+        LOGGER.info(f"VelocityMPS: {velocity_mps}")
+        engaged = standardizer.AutoGuidanceEngagement.get_signal()
+        LOGGER.info(f"AutoGuidanceEngagement: {engaged}")
+
+        insvpacmp = None
+        if cd.INSVPACMP is not None:
+            self.insva = cd.INSVPACMP
+        elif cd.INSPVACMP_1C is not None:
+            self.insva = cd.INSPVACMP_1C
+
+        if cd.INSVPACMP is not None:
+            insvpacmp = self.insva.data.dropna(subset=["Latitude"])
+            self.f_stable_ins_status = insvpacmp["INS_Status"] == 3
+            insvpacmp_stable = insvpacmp[self.f_stable_ins_status]
+
+        analysis_df = pd.DataFrame()
+        if (
+            insvpacmp is not None
+            and engaged is not None
+            and xte_m is not None
+        ):
+            if insvpacmp_stable.shape[0] > 0:
+                analysis_df = insvpacmp.join(engaged, how="outer")
+                analysis_df = analysis_df.join(xte_m, how="outer")
+                analysis_df = analysis_df.join(velocity_mps, how="outer")
+                analysis_df["INS_Status"].ffill(inplace=True)
+                analysis_df["engaged"].ffill(inplace=True)
+                analysis_df["engaged"].bfill(inplace=True)
+                analysis_df["Azimuth"].interpolate(inplace=True)
+                analysis_df["xte_m"].interpolate(inplace=True)
+                analysis_df["velocity_mps"].interpolate(inplace=True)
+                analysis_df.sort_index()
+                analysis_df = analysis_df.dropna(subset=["Latitude", "Longitude"])
+                analysis_df = analysis_df[self.f_stable_ins_status]
+
+        return analysis_df
+
+    def _generate_visualizations(self):
+        """Generates visualizations to be added to layout"""
+        self.f_gpssteering = self.analysis_df["engaged"]
+        self.geo_width = 800
+        self.geo_height = 600
+        self.button_width = 250
+        self.color_map = {
+            "blue": "#085cf8",
+            "green": "#64ae1d",
+            "yellow": "#f0cd18",
+            "pink": "#fc6f98",
+            "red": "#d90c11",
+            "blue2": "#1c8a97",
+            "green2": "#a0bd18",
+            "orange": "#fdad5b",
+            "pink2": "#f54195",
+            "green3": "#42a62a",
+        }
+        self.visualizations_settled = []
+        self.visualizations_unsettled = []
+        total_area_crushed = 0
+        settled_area = 0
+        unsettled_area = 0
+        bg_driven = cb.BokehGeospatial(
+            width=self.geo_width,
+            height=self.geo_height,
+            title="Tire Path Area",
+            colorbar="LINEAR_BGR",
+        )
+        _, _, total_tire_area = self._plot_tires(self.analysis_df, bg_driven)
+
+        settled_crush_area = 0
+        self.settled_times = []
+        for i, s_engagement in enumerate(self.s_engagement_list):
+            bg_settled_crushed = cb.BokehGeospatial(
+                width=self.geo_width,
+                height=self.geo_height,
+                title="Settled Crush",
+                colorbar="LINEAR_BGR",
+            )
+            bg_settled_crushed, high_xte_area_crushed, _ = self._plot_tires(
+                s_engagement, bg_settled_crushed
+            )
+            _, on_line_area_crushed = self._plot_tire_crush(
+                s_engagement, bg_settled_crushed
+            )
+            settled_crush_area += high_xte_area_crushed + on_line_area_crushed
+
+        for index_list in range(2):
+            i_list = self.settle_indices if index_list == 0 else self.no_settle_indices
+
+            for i, i_value in enumerate(i_list):
+                settled_df = self.all_engagement_list[i_value]
+                settled_df["xte_inch"] = settled_df["xte_m"] * 39.3701 # m to in
+                settled_df["velocity_mph"] = settled_df["velocity_mps"] * 2.23694 # mps to mph
+
+                visualizations = []
+                if (abs(settled_df["xte_m"] * 100) > 5).any():
+                    bg_xte = cb.BokehGeospatial(
+                        width=self.geo_width,
+                        height=self.geo_height,
+                        title="Cross Track Error",
+                        colorbar="LINEAR_BGR",
+                    )
+                    bg_vel = cb.BokehGeospatial(
+                        width=self.geo_width,
+                        height=self.geo_height,
+                        title="Velocity",
+                        colorbar="LINEAR_BGR",
+                    )
+                    bg_tire = cb.BokehGeospatial("Tire Paths", width=800, height=600)
+                    bg_crushed = cb.BokehGeospatial(
+                        width=self.geo_width,
+                        height=self.geo_height,
+                        title="Crushing Crop",
+                    )
+
+                    f = ((abs(stats.zscore(self.analysis_df["Latitude"])) < 5) &
+                    (abs(stats.zscore(self.analysis_df["Longitude"])) < 5))
+                    latitude = self.analysis_df["Latitude"][
+                        (self.analysis_df["Latitude"].index >= settled_df.index[0])
+                        & (self.analysis_df["Latitude"].index <= settled_df.index[-1])
+                    ]
+                    longitude = self.analysis_df["Longitude"][
+                        (self.analysis_df["Longitude"].index >= settled_df.index[0])
+                        & (self.analysis_df["Longitude"].index <= settled_df.index[-1])
+                    ]
+                    bg_xte = self._plot_geospatial_xte(
+                                latitude=settled_df["Latitude"],
+                                longitude=settled_df["Longitude"],
+                                azimuth=settled_df["Azimuth"],
+                                color_data=settled_df["xte_inch"],
+                                autoguidance=settled_df["engaged"],
+                                width=800,
+                                width_arrow=15,
+                                height_arrow=15,
+                                low=-10,
+                                high=10,
+                            )
+                    bg_tire.add_line_series(
+                        latitude=latitude[f],
+                        longitude=longitude[f],
+                        name="Trajectory",
+                        color="gray",
+                        line_width=3,
+                        alpha=0.5,
+                        center=True,
+                    )
+                    bg_crushed.add_line_series(
+                        latitude=latitude[f],
+                        longitude=longitude[f],
+                        name="Trajectory",
+                        color="white",
+                        line_width=3,
+                        alpha=0.5,
+                        center=True,
+                    )
+                    bg_vel = tj.plot_geospatial_velocity(
+                                latitude=settled_df["Latitude"],
+                                longitude=settled_df["Longitude"],
+                                azimuth=settled_df["Azimuth"],
+                                color_data=settled_df["velocity_mph"],
+                                width=800,
+                                width_arrow=15,
+                                height_arrow=15,
+                                nth_row_arrow=1000,
+                                low = -22,
+                                high = 22,
+                                )
+
+                    bg_tire, high_xte_area_crushed, _ = self._plot_tires(
+                        settled_df, bg_tire
+                    )
+                    bg_tire, on_line_area_crushed = self._plot_tire_crush(
+                        settled_df, bg_tire
+                    )
+                    bg_crushed = self._plot_crushed_crop(settled_df, bg_crushed)
+
+                    total_area_crushed += high_xte_area_crushed + on_line_area_crushed
+
+                    if index_list == 0:
+                        for vis in [bg_xte, bg_crushed, bg_vel, bg_tire]:
+                            vis.p.title.text_font_size = "16pt"
+                            settled_time = self.message_index_list_5[i]
+                            f_settle_time = settled_df["Message_Time"] == settled_time
+                            latitude = settled_df["Latitude"][f_settle_time]
+                            if latitude.index is not None:
+                                latitude_datetime = pd.to_datetime(latitude.index)
+                                self.settled_times.append(latitude_datetime.strftime("%H:%M:%S"))
+                            longitude = settled_df["Longitude"][f_settle_time]
+                            vis.add_categorical_series(
+                                latitude=latitude,
+                                longitude=longitude,
+                                name="Settled",
+                                color=self.color_map["blue"],
+                                size=10,
+                                line_color="black",
+                                line_width=1,
+                            )
+                    visualizations.append(("XTE bg", bg_xte))
+                    visualizations.append(("Crushed crop plot", bg_crushed))
+                    visualizations.append(("Velocity plot", bg_vel))
+                    visualizations.append(("Tire plot", bg_tire))
+
+                    if index_list == 0:
+                        self.visualizations_settled.append(visualizations)
+                        settled_area += total_area_crushed
+                    else:
+                        self.visualizations_unsettled.append(visualizations)
+                        unsettled_area += total_area_crushed
+
+                visualizations = []
+
+        return settled_area, unsettled_area, settled_crush_area, total_tire_area
+
+    def _generate_overview_table(
+        self,
+        settled_area,
+        unsettled_area,
+        settled_crush_area,
+        total_tire_area,
+        tire_width,
+        tread_width,
+        crushing_xte,
+    ):
+        ureg = pint.UnitRegistry()
+        tire_width = self._mm_to_inch(tire_width)
+        tread_width = self._mm_to_inch(tread_width)
+        if self.product_model is None:
+            self.product_model = "Data not provided"
+        if self.slot_id and self.vehicle:
+            self.product_model = (
+                str(self.vehicle.vin_tag.name) + " " + str(self.vehicle.vin_tag.model)
+            )
+
+        self.wheelbase = ((self.wheelbase * ureg.meter).to(ureg.inch)).magnitude
+        LOGGER.info(f"Product Model: {self.product_model}")
+
+        start_datetime = str(
+            (pd.to_datetime(self.insva.index.min())).strftime(
+                "%m/%d/%Y, %H:%M:%S"
+            )
+        )
+        stop_datetime = str(
+            (pd.to_datetime(self.insva.index.max())).strftime(
+                "%m/%d/%Y, %H:%M:%S"
+            )
+        )
+        total_dataset_time_min = (
+            (pd.to_datetime(self.insva.index.max()))
+            - (pd.to_datetime(self.insva.index.min()))
+        ).total_seconds() / 60
+        data_collection_date = self.analysis_df.index[0].strftime("%a, %d %b, %Y")
+
+        total_engagements = len(self.ag_engagement)
+        num_ag_engagement = len(self.visualizations_settled)
+
+        if self.analysis_df is not None:
+            data_collection_location = coordinates_to_address(
+                latitude=self.analysis_df["Latitude"].median(),
+                longitude=self.analysis_df["Longitude"].median(),
+            )
+        else:
+            data_collection_location = "Data not provided"
+
+        crushing_xte = ((crushing_xte * ureg.centimeter).to(ureg.inch)).magnitude
+
+        bt_overview_table = self._get_overview_table(
+            product_model=self.product_model,
+            tire_width=tire_width,
+            tread_width=tread_width,
+            wheelbase=self.wheelbase,
+            data_collection_date=data_collection_date,
+            start_datetime=str(start_datetime),
+            stop_datetime=stop_datetime,
+            total_dataset_time_min=total_dataset_time_min,
+            data_collection_location=data_collection_location[8:-1],
+            total_engagements=total_engagements,
+            num_ag_engagement=num_ag_engagement,
+            crushing_xte=crushing_xte,
+            total_tire_area=total_tire_area,
+            crushed_crop_engaged=unsettled_area + settled_area,
+            crushed_crop_settled=settled_crush_area,
+        )
+
+        return bt_overview_table
+
+    def _save_to_html(self):
+        """Create Bokeh Layout to save visualizations to html"""
+        bt_overview_table = self._generate_overview_table(
+            settled_area=self.settled_area,
+            unsettled_area=self.unsettled_area,
+            settled_crush_area=self.settled_crush_area,
+            total_tire_area=self.total_tire_area,
+            tire_width=self.tire_width,
+            tread_width=self.tread_width,
+            crushing_xte=self.xte_allowance,
+        )
+
+        LOGGER.info("Creating Bokeh Layout for Crushed Crop Analysis")
+        if self.bl is None:
+            b_ag = rt.initiate_BokehLayout("Crushed Crop Analysis", "CANData")
+            b_ag.add_description(
+                "<strong>NOTE: </strong> Settling based on 1.97 in "
+                "(5 cm) cross track error"
+            )
+        else:
+            b_ag = self.bl
+        b_ag.add_row(bt_overview_table)
+        if len(self.settle_indices) > 1:
+            b_ag.add_description("<h1>Settled Engagements</h1>")
+
+        for i, lst in enumerate(self.visualizations_settled):
+            LOGGER.info(f"Settled Engagement: {i+1}")
+            e_time = (
+                self.all_engagement_list[self.settle_indices[i]]
+                .index[0]
+                .strftime("%H:%M:%S")
+            )
+            b_ag.add_description(
+                f"<h2>Settled Engagement {i+1} at {e_time}</h2>"
+            )
+            b_ag.add_row([lst[0][1], lst[1][1]], separators=True, separator_width=40)
+            b_ag.add_row([lst[2][1], lst[3][1]], separators=True, separator_width=40)
+            b_ag.add_horizontal_line()
+        if len(self.no_settle_indices) > 1:
+            b_ag.add_description("<h1>Unsettled Engagements</h1>")
+        for i, lst in enumerate(self.visualizations_unsettled):
+            LOGGER.info(f"Unsettled Engagement: {i+1}")
+            e_time = self.all_engagement_list[self.no_settle_indices[i]].index[0]
+            e_time = e_time.strftime("%H:%M:%S")
+            b_ag.add_description(f"<h2>Engagement {i+1} at {e_time}</h2>")
+            b_ag.add_row([lst[0][1], lst[1][1]], separators=True, separator_width=40)
+            b_ag.add_row([lst[2][1], lst[3][1]], separators=True, separator_width=40)
+            b_ag.add_horizontal_line()
+        LOGGER.info("Saving Layout")
+        LOGGER.info(f"Product Model: {self.product_model}")
+
+        return b_ag
+
+    def _get_overview_table(
+        self,
+        product_model,
+        tire_width,
+        tread_width,
+        wheelbase,
+        data_collection_date,
+        start_datetime,
+        stop_datetime,
+        total_dataset_time_min,
+        data_collection_location,
+        total_engagements,
+        num_ag_engagement,
+        crushing_xte,
+        total_tire_area,
+        crushed_crop_engaged,
+        crushed_crop_settled,
+    ):
+        LOGGER.info("Creating overview table")
+        overview = [
+            ["Product Model", product_model],
+            ["Tire Width", f"{tire_width:.2f} in"],
+            ["Tread Width", f"{tread_width:.2f} in"],
+            ["Wheelbase", f"{wheelbase:.2f} in"],
+            ["Data Collection Date", data_collection_date],
+            ["Start Time", start_datetime],
+            ["Stop Time", stop_datetime],
+            ["Total Time", f"{total_dataset_time_min:.2f} min"],
+            ["Data Collection Location", data_collection_location],
+            ["Total Engagements", total_engagements],
+            ["Number of Settled Engagements Crushing Crop", num_ag_engagement],
+            ["Crushing Criteria", f"XTE > {crushing_xte:.2f} in"],
+            ["Area Driven", f"{total_tire_area:.2f} m\u00b2"],
+            ["Crushed Crop While Engaged", f"{crushed_crop_engaged:.2f} m\u00b2"],
+            ["Crushed Crop After Settling", f"{crushed_crop_settled:.2f} m\u00b2"],
+        ]
+        overview_table = pd.DataFrame(overview, columns=["Parameter", "Value"])
+        bt_overview_table = cb.BokehTable(
+            overview_table, show_index=False
+        )
+
+        return bt_overview_table
+
+    def _settling_times_dfs(self):
+        """Gets settling times for 5cm xte
+
+        Returns:
+            message_index_list_5 (list): List of 5cm settling times
+        """
+        message_index_list_5 = []
+        for i, all_engagement in enumerate(self.all_engagement_list):
+            last_index = all_engagement["Message_Time"][-1]
+            for xte_limit in [self.xte_allowance]:
+                settled_time = self._find_settled_time(
+                    self.all_engagement_list[i], xte_limit
+                )
+                if xte_limit == 5 and settled_time < last_index:
+                    message_index_list_5.append(settled_time)
+                elif xte_limit == 5 and settled_time >= last_index:
+                    message_index_list_5.append(None)
+
+        settling_times_5 = self.all_engagement_df[
+            (self.all_engagement_df["Message_Time"].isin(message_index_list_5))
+        ]
+        settling_times_5 = settling_times_5[
+            ~settling_times_5.index.duplicated(keep="first")
+        ]
+        return message_index_list_5  # Gets settling time (datetime)
+
+    def _get_no_settle_df(self):
+        """Gets dataframe of engagements that do not settle"""
+        self.message_index_list_5 = self._settling_times_dfs()
+        no_settle = []
+        indices = []
+        no_settle_indices = []
+
+        for i, all_engagement in enumerate(self.all_engagement_list):
+            if self.message_index_list_5[i] not in all_engagement.values:
+                start = all_engagement.index[0]
+                if i != len(self.all_engagement_list) - 1:
+                    end = self.all_engagement_list[i + 1].index[0]
+                else:
+                    end = self.analysis_df[self._get_engaged_f].index[-1]
+                for r in self.analysis_df[self._get_engaged_f].itertuples():
+                    if r.Index >= start and r.Index < end:
+                        indices.append(r.Index)
+                        append_df = self.analysis_df[
+                            self.analysis_df.index.isin(indices)
+                        ]
+                no_settle.append(append_df)
+                no_settle_indices.append(i)
+
+        return no_settle, no_settle_indices
+
+    def _get_engaged_f(self, df):
+        """Gets engaged DataFrame filter
+
+        Args:
+            :obj:`pd.DataFrame`: a Pandas DataFrame to create filter on
+
+        Returns:
+            engaged_f(:obj:'pd.Series'): a Pandas Series for when auto guidance is engaged
+        """
+        engaged_f = df["engaged"]
+
+        return engaged_f
+
+    def _find_settled_time(self, df, xte_limit):
+        f = self._get_engaged_f(df)
+
+        tdf = df[f]
+
+        # Max xte over 10s window. Rolling max is calculated backwards in time.
+        settled_f = abs((tdf['xte_m']*100)[::-1]).rolling('10s').max() <= xte_limit
+        settled_f = settled_f[::-1]
+        if not settled_f.any():
+            settled_time = df['Message_Time'][-1]
+        else:
+            settled_time = tdf[settled_f]['Message_Time'][0]
+        return settled_time
+
+    def _get_engagement_df(self):
+        """Gets engagement points
+
+        Returns:
+            ag_engagement(:obj:'pd.DataFrame'): a Pandas DataFrame containing engagement points
+        """
+        LOGGER.info("Getting Engagement df")
+        steeringmode = self.analysis_df["engaged"]
+        f1 = steeringmode
+        f2 = steeringmode != steeringmode.shift()
+        f3 = steeringmode.shift() is not True
+
+        ag_engagement = self.analysis_df[f1 & f2 & f3]
+        if ag_engagement.shape[0] > self._get_disengagement_df().shape[0]:
+            ag_engagement = ag_engagement.iloc[:-1, :]
+
+        return ag_engagement
+
+    def _get_disengagement_df(self):
+        """Gets disengagement DataFrames
+
+        Returns:
+            mo_disengagement (:obj:`pd.DataFrame`): a Pandas DataFrame containing
+                                                    manual override disengagements
+            disengagement (:obj:`pd.DataFrame`): a Pandas DataFrame containing disengagements
+                                                    without manual override
+        """
+        LOGGER.info("Getting disengagement df")
+        # Disengagement filters
+        steeringmode = self.analysis_df["engaged"]
+        f1 = self.analysis_df["Latitude"] != 0
+        f2 = steeringmode != steeringmode.shift()
+        f3 = steeringmode.shift() is True
+
+        disengagement_df = self.analysis_df[f1 & f2 & f3]
+
+        return disengagement_df
+
+    def _get_engagement_dfs(self):
+        """Gets engagement list and DataFrame"""
+        self.ag_disengagement = self._get_disengagement_df()
+        self.ag_engagement = self._get_engagement_df()
+        LOGGER.info("Getting DataFrames")
+        indices = []
+        self.all_engagement_list = []
+        f_ag = self.analysis_df["engaged"]
+
+        for count in range(self.ag_engagement.shape[0]):
+            start = self.ag_engagement.index[count]
+            end = self.ag_disengagement.index[count]
+            for r in self.analysis_df[f_ag].itertuples():
+                if r.Index >= start and r.Index < end:
+                    indices.append(r.Index)
+            df = self.analysis_df[self.analysis_df.index.isin(indices)]
+            if df.shape[0] != 0:
+                self.all_engagement_list.append(df)
+            indices = []
+
+        self.all_engagement_df = pd.concat(self.all_engagement_list)
+        self.no_settle, self.no_settle_indices = self._get_no_settle_df()
+
+        self.settle_indices = []
+        for index in range(len(self.all_engagement_list)):
+            if index not in self.no_settle_indices:
+                self.settle_indices.append(index)
+
+        self.message_index_list_5 = self._settling_times_dfs()
+        self.s_engagement_list = self.all_engagement_list.copy()
+        for num in reversed(range(len(self.no_settle_indices))):
+            self.s_engagement_list.pop(self.no_settle_indices[num])
+            self.message_index_list_5.pop(self.no_settle_indices[num])
+
+        LOGGER.info(f"Settle indices: {self.settle_indices}.")
+        LOGGER.info(f"No settle indices: {self.no_settle_indices}.")
+        LOGGER.info(f"Message index list: {self.message_index_list_5}.")
+
+        self.s_engagement_df = pd.concat(self.s_engagement_list)
+        self.s_engagement_df = self.s_engagement_df[
+            self.s_engagement_df["INS_Status"] == 3
+        ]
+
+    def _mm_to_inch(self, mm_value):
+        """Converts mm to inch
+
+        Args:
+            mm (int): Number to convert to inches
+
+        Returns:
+            (int): Number in inches
+        """
+        ureg = pint.UnitRegistry()
+
+        return ((mm_value * ureg.mm).to(ureg.inch)).magnitude
+
+    def _get_crushing_trunks(self, df, xte):
+        df["Crushing"] = abs((df["xte_m"]) * 100) >= xte
+        df = df.sort_index()
+
+        f_start = (df["Crushing"]) & (df["Crushing"] != df["Crushing"].shift())
+        f_stop = (df["Crushing"]) & (df["Crushing"] != df["Crushing"].shift(-1))
+
+        dfs = []
+        for start, stop in zip(f_start[f_start].index, f_stop[f_stop].index):
+            dfs.append(df.loc[start:stop])
+
+        return dfs
+
+    def _build_polygon_from_row(self, row):
+        """Create Shapely Polygon from latitude and longitude of two adjasent epochs
+
+        Args:
+            row (dict): a row of pd.DataFrame with latitude and longitude of two adjasent epochs
+
+        Returns:
+            :obj:`Polygon`: Shapely Polygon
+        """
+        points = [
+            (row["longitude_left"], row["latitude_left"]),
+            (row["longitude_right"], row["latitude_right"]),
+            (row["longitude_right_shift1"], row["latitude_right_shift1"]),
+            (row["longitude_left_shift1"], row["latitude_left_shift1"]),
+        ]
+        polygon = Polygon(points)
+        if polygon.is_valid:
+            return polygon
+        return polygon.buffer(0)
+
+    def _union_borders(self, geoms):
+        """Returns a geometry containing the union of all geometries in the list
+
+        Args:
+            geoms (list): a list of Shapely Polygons and MultiPolygons
+        """
+        return unary_union(
+            [geom if geom.is_valid else geom.buffer(0) for geom in geoms]
+        )
+
+    def _plot_tires(self, df, bg_graph):
+        LOGGER.info("Plotting tires")
+        # Front Tires
+        self.tire_m = self.tire_width / 1000  # m
+        self.tread_m = self.tread_width / 1000  # m
+        self.tire_cm = self.tire_width / 10
+        self.one_side_tread_space = self.tread_m / 2
+        self.height_to_ground = (
+            -self.height_offset / 1000
+        )  # always negative (from antenna to ground)
+        self.faxle_to_back = (
+            -self.wheelbase / 1000
+        )  # always negative (from front axle to back)
+
+        right_front_inner_offsets = []
+        right_front_inner_offsets.append(
+            GeospatialOffset(
+                [self.one_side_tread_space, 0, 0],
+                tail="Center Fixed Axle",
+                head="Inner Right Front Tire",
+            )
+        )
+        right_front_inner_offsets.append(
+            GeospatialOffset(
+                [0, 0, self.height_to_ground],
+                tail="Inner Right Front Tire",
+                head="Bottom Inner Right Front Tire",
+            )
+        )
+
+        right_front_outer_offsets = []
+        right_front_outer_offsets.append(
+            GeospatialOffset(
+                [self.one_side_tread_space + self.tire_m, 0, 0],
+                tail="Center Fixed Axle",
+                head="Outer Right Front Tire",
+            )
+        )
+        right_front_outer_offsets.append(
+            GeospatialOffset(
+                [0, 0, self.height_to_ground],
+                tail="Outer Right Front Tire",
+                head="Bottom Outer Right Front Tire",
+            )
+        )
+
+        left_front_inner_offsets = []
+        left_front_inner_offsets.append(
+            GeospatialOffset(
+                [-self.one_side_tread_space, 0, 0],
+                tail="Center Fixed Axle",
+                head="Inner Left Front Tire",
+            )
+        )
+        left_front_inner_offsets.append(
+            GeospatialOffset(
+                [0, 0, self.height_to_ground],
+                tail="Inner Left Front Tire",
+                head="Bottom Inner Left Front Tire",
+            )
+        )
+
+        left_front_outer_offsets = []
+        left_front_outer_offsets.append(
+            GeospatialOffset(
+                [-self.one_side_tread_space - self.tire_m, 0, 0],
+                tail="Center Fixed Axle",
+                head="Outer Left Front Tire",
+            )
+        )
+        left_front_outer_offsets.append(
+            GeospatialOffset(
+                [0, 0, self.height_to_ground],
+                tail="Outer Left Front Tire",
+                head="Bottom Outer Left Front Tire",
+            )
+        )
+
+        # Back Tires
+        right_back_inner_offsets = []
+        right_back_inner_offsets.append(
+            GeospatialOffset(
+                [self.one_side_tread_space, self.faxle_to_back, 0],
+                tail="Center Fixed Axle",
+                head="Inner Right Back Tire",
+            )
+        )
+        right_back_inner_offsets.append(
+            GeospatialOffset(
+                [0, 0, self.height_to_ground],
+                tail="Inner Right Back Tire",
+                head="Bottom Inner Right Back Tire",
+            )
+        )
+
+        right_back_outer_offsets = []
+        right_back_outer_offsets.append(
+            GeospatialOffset(
+                [self.one_side_tread_space + self.tire_m, self.faxle_to_back, 0],
+                tail="Center Fixed Axle",
+                head="Outer Right Back Tire",
+            )
+        )
+        right_back_outer_offsets.append(
+            GeospatialOffset(
+                [0, 0, self.height_to_ground],
+                tail="Outer Right Back Tire",
+                head="Bottom Outer Right Back Tire",
+            )
+        )
+
+        left_back_inner_offsets = []
+        left_back_inner_offsets.append(
+            GeospatialOffset(
+                [-self.one_side_tread_space, self.faxle_to_back, 0],
+                tail="Center Fixed Axle",
+                head="Inner Left Back Tire",
+            )
+        )
+        left_back_inner_offsets.append(
+            GeospatialOffset(
+                [0, 0, self.height_to_ground],
+                tail="Inner Left Back Tire",
+                head="Bottom Inner Left Back Tire",
+            )
+        )
+
+        left_back_outer_offsets = []
+        left_back_outer_offsets.append(
+            GeospatialOffset(
+                [-self.one_side_tread_space - self.tire_m, self.faxle_to_back, 0],
+                tail="Center Fixed Axle",
+                head="Outer Left Back Tire",
+            )
+        )
+        left_back_outer_offsets.append(
+            GeospatialOffset(
+                [0, 0, self.height_to_ground],
+                tail="Outer Left Back Tire",
+                head="Bottom Outer Left Back Tire",
+            )
+        )
+
+        right_front_inner_offset = chain_geospatial_offsets(
+            "Center Fixed Axle",
+            "Bottom Inner Right Front Tire",
+            right_front_inner_offsets,
+        )
+        right_front_outer_offset = chain_geospatial_offsets(
+            "Center Fixed Axle",
+            "Bottom Outer Right Front Tire",
+            right_front_outer_offsets,
+        )
+        left_front_inner_offset = chain_geospatial_offsets(
+            "Center Fixed Axle",
+            "Bottom Inner Left Front Tire",
+            left_front_inner_offsets,
+        )
+        left_front_outer_offset = chain_geospatial_offsets(
+            "Center Fixed Axle",
+            "Bottom Outer Left Front Tire",
+            left_front_outer_offsets,
+        )
+
+        right_back_inner_offset = chain_geospatial_offsets(
+            "Center Fixed Axle",
+            "Bottom Inner Right Back Tire",
+            right_back_inner_offsets,
+        )
+        right_back_outer_offset = chain_geospatial_offsets(
+            "Center Fixed Axle",
+            "Bottom Outer Right Back Tire",
+            right_back_outer_offsets,
+        )
+        left_back_inner_offset = chain_geospatial_offsets(
+            "Center Fixed Axle", "Bottom Inner Left Back Tire", left_back_inner_offsets
+        )
+        left_back_outer_offset = chain_geospatial_offsets(
+            "Center Fixed Axle", "Bottom Outer Left Back Tire", left_back_outer_offsets
+        )
+
+        insvpa = df.rename(
+            columns={
+                "Roll": "roll",
+                "Pitch": "pitch",
+                "Azimuth": "azimuth",
+                "Latitude": "latitude",
+                "Longitude": "longitude",
+                "Height": "ellipsoidal_height",
+            }
+        )
+
+        right_front_inner_offset_df = apply_geospatial_offset(
+            right_front_inner_offset, insvpa
+        )
+        right_front_outer_offset_df = apply_geospatial_offset(
+            right_front_outer_offset, insvpa
+        )
+        left_front_inner_offset_df = apply_geospatial_offset(
+            left_front_inner_offset, insvpa
+        )
+        left_front_outer_offset_df = apply_geospatial_offset(
+            left_front_outer_offset, insvpa
+        )
+
+        right_back_inner_offset_df = apply_geospatial_offset(
+            right_back_inner_offset, insvpa
+        )
+        right_back_outer_offset_df = apply_geospatial_offset(
+            right_back_outer_offset, insvpa
+        )
+        left_back_inner_offset_df = apply_geospatial_offset(
+            left_back_inner_offset, insvpa
+        )
+        left_back_outer_offset_df = apply_geospatial_offset(
+            left_back_outer_offset, insvpa
+        )
+
+        right_front = right_front_inner_offset_df.join(
+            right_front_outer_offset_df, how="outer", lsuffix="_left", rsuffix="_right"
+        )
+        left_front = left_front_inner_offset_df.join(
+            left_front_outer_offset_df, how="outer", lsuffix="_right", rsuffix="_left"
+        )
+        right_back = right_back_inner_offset_df.join(
+            right_back_outer_offset_df, how="outer", lsuffix="_left", rsuffix="_right"
+        )
+        left_back = left_back_inner_offset_df.join(
+            left_back_outer_offset_df, how="outer", lsuffix="_right", rsuffix="_left"
+        )
+
+        f_crushed = (
+            abs((insvpa["xte_m"]) * 100) >= self.xte_allowance + self.tire_cm
+        )
+
+        total_area = 0
+
+        polygon_lists = [
+            right_front,
+            left_front,
+            right_back,
+            left_back,
+        ]
+
+        for points in polygon_lists:
+            polygons = get_filtered_polygons(
+                points, (self.f_gpssteering)
+            )
+            for polygon in polygons:
+                if isinstance(polygon, MultiPolygon):
+                    for geom in list(polygon.geoms):
+                        add_patch(
+                            figure_object=bg_graph,
+                            geom=geom,
+                            fill_color="orange",
+                            fill_alpha=1,
+                            name="Tire Coverage",
+                        )
+                elif isinstance(polygon, Polygon):
+                    add_patch(
+                        figure_object=bg_graph,
+                        geom=polygon,
+                        fill_color="orange",
+                        fill_alpha=1,
+                        name="Tire Coverage",
+                    )
+
+            total_area += self._get_polygons_area(polygons)
+
+        crushed_num = self.tire_cm + self.xte_allowance - 4  # polygon creation overlap
+        f_crushed = abs((insvpa["xte_m"]) * 100) >= crushed_num
+
+        right_front = right_front.join(insvpa["xte_m"], how="left")
+        dfs_right_front = self._get_crushing_trunks(right_front, crushed_num)
+
+        high_xte_area_crushed = 0
+        for df_right_front in dfs_right_front:
+            df_left_front = left_front[left_front.index.isin(df_right_front.index)]
+            df_right_back = right_back[right_back.index.isin(df_right_front.index)]
+            df_left_back = left_back[left_back.index.isin(df_right_front.index)]
+
+            df_polygon_lists = [
+                df_right_front,
+                df_left_front,
+                df_right_back,
+                df_left_back,
+                ]
+
+            for points in df_polygon_lists:
+                polygons = get_filtered_polygons(
+                    points, (f_crushed & self.f_gpssteering)
+                )
+                for polygon in polygons:
+                    if isinstance(polygon, MultiPolygon):
+                        for geom in list(polygon.geoms):
+                            add_patch(
+                                figure_object=bg_graph,
+                                geom=geom,
+                                fill_color="red",
+                                fill_alpha=1,
+                                name="Crushed Crop",
+                            )
+                    elif isinstance(polygon, Polygon):
+                        add_patch(
+                            figure_object=bg_graph,
+                            geom=polygon,
+                            fill_color="red",
+                            fill_alpha=1,
+                            name="Crushed Crop",
+                        )
+
+                high_xte_area_crushed += self._get_polygons_area(polygons)
+
+            LOGGER.info("Done plotting tires")
+
+        return bg_graph, high_xte_area_crushed, total_area
+
+    def _get_polygons_area(self, polygons):
+        """Calculate the total area for a list Shapely polygons
+
+        Args:
+            polygons: a list of Shapely polygons
+        """
+        geod = Geod(ellps="WGS84")
+        multipolygon = self._union_borders(polygons)
+        field_area, _ = geod.geometry_area_perimeter(multipolygon)
+        field_area_sqm = np.abs(field_area)
+
+        return field_area_sqm
+
+    def _plot_tire_crush(self, df, bg_graph):
+        LOGGER.info("Plotting tire crush")
+        insvpa = df.rename(
+            columns={
+                "Roll": "roll",
+                "Pitch": "pitch",
+                "Azimuth": "azimuth",
+                "Latitude": "latitude",
+                "Longitude": "longitude",
+                "Height": "ellipsoidal_height",
+            }
+        )
+
+        xte_col_cm = insvpa["xte_m"] * 100
+        f_pos_xte = (xte_col_cm > self.xte_allowance) & (
+            xte_col_cm < (self.xte_allowance + self.tire_cm + 4)
+        )
+        f_neg_xte = (xte_col_cm > -(self.xte_allowance + self.tire_cm - 4)) & (
+            xte_col_cm < -self.xte_allowance
+        )
+
+        pos_xte_df = insvpa[f_pos_xte]
+        neg_xte_df = insvpa[f_neg_xte]
+
+        # Front Tires
+        # Positive xte Inner to guidance tire crushing = (XTE-5) to the left of the right most tire
+        positive_offsets = []
+        negative_offsets = []
+        xte_allowance_m = self.xte_allowance / 100  # m
+        tire_on_line_area_crushed = 0
+
+        # positive_offsets
+        right_front_outer_offsets = []
+        right_front_outer_offsets.append(
+            GeospatialOffset(
+                [self.one_side_tread_space + self.tire_m, 0, 0],
+                tail="Center Fixed Axle",
+                head="Outer Right Front Tire",
+            )
+        )
+        right_front_outer_offsets.append(
+            GeospatialOffset(
+                [0, 0, self.height_to_ground],
+                tail="Outer Right Front Tire",
+                head="Bottom Outer Right Front Tire",
+            )
+        )
+
+        left_front_inner_offsets = []
+        left_front_inner_offsets.append(
+            GeospatialOffset(
+                [-self.one_side_tread_space, 0, 0],
+                tail="Center Fixed Axle",
+                head="Inner Left Front Tire",
+            )
+        )
+        left_front_inner_offsets.append(
+            GeospatialOffset(
+                [0, 0, self.height_to_ground],
+                tail="Inner Left Front Tire",
+                head="Bottom Inner Left Front Tire",
+            )
+        )
+
+        right_back_outer_offsets = []
+        right_back_outer_offsets.append(
+            GeospatialOffset(
+                [self.one_side_tread_space + self.tire_m, self.faxle_to_back, 0],
+                tail="Center Fixed Axle",
+                head="Outer Right Back Tire",
+            )
+        )
+        right_back_outer_offsets.append(
+            GeospatialOffset(
+                [0, 0, self.height_to_ground],
+                tail="Outer Right Back Tire",
+                head="Bottom Outer Right Back Tire",
+            )
+        )
+
+        left_back_inner_offsets = []
+        left_back_inner_offsets.append(
+            GeospatialOffset(
+                [-self.one_side_tread_space, self.faxle_to_back, 0],
+                tail="Center Fixed Axle",
+                head="Inner Left Back Tire",
+            )
+        )
+        left_back_inner_offsets.append(
+            GeospatialOffset(
+                [0, 0, self.height_to_ground],
+                tail="Inner Left Back Tire",
+                head="Bottom Inner Left Back Tire",
+            )
+        )
+
+        for r in pos_xte_df.itertuples():
+            xte = (r.xte_m) - xte_allowance_m
+            right_front_inner_offsets = []
+            right_front_inner_offsets.append(
+                GeospatialOffset(
+                    [self.one_side_tread_space + self.tire_m - xte, 0, 0],
+                    tail="Center Fixed Axle",
+                    head="Inner Right Front Tire",
+                )
+            )
+            right_front_inner_offsets.append(
+                GeospatialOffset(
+                    [0, 0, self.height_to_ground],
+                    tail="Inner Right Front Tire",
+                    head="Bottom Inner Right Front Tire",
+                )
+            )
+
+            left_front_outer_offsets = []
+            left_front_outer_offsets.append(
+                GeospatialOffset(
+                    [-self.one_side_tread_space - xte, 0, 0],
+                    tail="Center Fixed Axle",
+                    head="Outer Left Front Tire",
+                )
+            )
+            left_front_outer_offsets.append(
+                GeospatialOffset(
+                    [0, 0, self.height_to_ground],
+                    tail="Outer Left Front Tire",
+                    head="Bottom Outer Left Front Tire",
+                )
+            )
+
+            # Back Tires
+            right_back_inner_offsets = []
+            right_back_inner_offsets.append(
+                GeospatialOffset(
+                    [
+                        self.one_side_tread_space + self.tire_m - xte,
+                        self.faxle_to_back,
+                        0,
+                    ],
+                    tail="Center Fixed Axle",
+                    head="Inner Right Back Tire",
+                )
+            )
+            right_back_inner_offsets.append(
+                GeospatialOffset(
+                    [0, 0, self.height_to_ground],
+                    tail="Inner Right Back Tire",
+                    head="Bottom Inner Right Back Tire",
+                )
+            )
+
+            left_back_outer_offsets = []
+            left_back_outer_offsets.append(
+                GeospatialOffset(
+                    [-self.one_side_tread_space - xte, self.faxle_to_back, 0],
+                    tail="Center Fixed Axle",
+                    head="Outer Left Back Tire",
+                )
+            )
+            left_back_outer_offsets.append(
+                GeospatialOffset(
+                    [0, 0, self.height_to_ground],
+                    tail="Outer Left Back Tire",
+                    head="Bottom Outer Left Back Tire",
+                )
+            )
+
+            positive_offsets.extend(
+                [
+                    right_front_inner_offsets,
+                    right_front_outer_offsets,
+                    left_front_inner_offsets,
+                    left_front_outer_offsets,
+                    right_back_inner_offsets,
+                    right_back_outer_offsets,
+                    left_back_inner_offsets,
+                    left_back_outer_offsets,
+                ]
+            )
+
+        # negative_offsets
+        right_front_inner_offsets = []
+        right_front_inner_offsets.append(
+            GeospatialOffset(
+                [self.one_side_tread_space, 0, 0],
+                tail="Center Fixed Axle",
+                head="Inner Right Front Tire",
+            )
+        )
+        right_front_inner_offsets.append(
+            GeospatialOffset(
+                [0, 0, self.height_to_ground],
+                tail="Inner Right Front Tire",
+                head="Bottom Inner Right Front Tire",
+            )
+        )
+
+        left_front_outer_offsets = []
+        left_front_outer_offsets.append(
+            GeospatialOffset(
+                [(-self.one_side_tread_space - self.tire_m), 0, 0],
+                tail="Center Fixed Axle",
+                head="Outer Left Front Tire",
+            )
+        )
+        left_front_outer_offsets.append(
+            GeospatialOffset(
+                [0, 0, self.height_to_ground],
+                tail="Outer Left Front Tire",
+                head="Bottom Outer Left Front Tire",
+            )
+        )
+
+        right_back_inner_offsets = []
+        right_back_inner_offsets.append(
+            GeospatialOffset(
+                [self.one_side_tread_space, self.faxle_to_back, 0],
+                tail="Center Fixed Axle",
+                head="Inner Right Back Tire",
+            )
+        )
+        right_back_inner_offsets.append(
+            GeospatialOffset(
+                [0, 0, self.height_to_ground],
+                tail="Inner Right Back Tire",
+                head="Bottom Inner Right Back Tire",
+            )
+        )
+
+        left_back_outer_offsets = []
+        left_back_outer_offsets.append(
+            GeospatialOffset(
+                [-self.one_side_tread_space - self.tire_m, self.faxle_to_back, 0],
+                tail="Center Fixed Axle",
+                head="Outer Left Back Tire",
+            )
+        )
+        left_back_outer_offsets.append(
+            GeospatialOffset(
+                [0, 0, self.height_to_ground],
+                tail="Outer Left Back Tire",
+                head="Bottom Outer Left Back Tire",
+            )
+        )
+
+        for r in neg_xte_df.itertuples():
+            # Front Tires
+            xte = abs(r.xte_m) - xte_allowance_m
+            right_front_outer_offsets = []
+            right_front_outer_offsets.append(
+                GeospatialOffset(
+                    [self.one_side_tread_space + xte, 0, 0],
+                    tail="Center Fixed Axle",
+                    head="Outer Right Front Tire",
+                )
+            )
+            right_front_outer_offsets.append(
+                GeospatialOffset(
+                    [0, 0, self.height_to_ground],
+                    tail="Outer Right Front Tire",
+                    head="Bottom Outer Right Front Tire",
+                )
+            )
+
+            left_front_inner_offsets = []
+            left_front_inner_offsets.append(
+                GeospatialOffset(
+                    [(-self.one_side_tread_space - self.tire_m + xte), 0, 0],
+                    tail="Center Fixed Axle",
+                    head="Inner Left Front Tire",
+                )
+            )
+            left_front_inner_offsets.append(
+                GeospatialOffset(
+                    [0, 0, self.height_to_ground],
+                    tail="Inner Left Front Tire",
+                    head="Bottom Inner Left Front Tire",
+                )
+            )
+
+            # Back Tires
+            right_back_outer_offsets = []
+            right_back_outer_offsets.append(
+                GeospatialOffset(
+                    [self.one_side_tread_space + xte, self.faxle_to_back, 0],
+                    tail="Center Fixed Axle",
+                    head="Outer Right Back Tire",
+                )
+            )
+            right_back_outer_offsets.append(
+                GeospatialOffset(
+                    [0, 0, self.height_to_ground],
+                    tail="Outer Right Back Tire",
+                    head="Bottom Outer Right Back Tire",
+                )
+            )
+
+            left_back_inner_offsets = []
+            left_back_inner_offsets.append(
+                GeospatialOffset(
+                    [
+                        (-self.one_side_tread_space - self.tire_m + xte),
+                        self.faxle_to_back,
+                        0,
+                    ],
+                    tail="Center Fixed Axle",
+                    head="Inner Left Back Tire",
+                )
+            )
+            left_back_inner_offsets.append(
+                GeospatialOffset(
+                    [0, 0, self.height_to_ground],
+                    tail="Inner Left Back Tire",
+                    head="Bottom Inner Left Back Tire",
+                )
+            )
+
+            negative_offsets.extend(
+                [
+                    right_front_inner_offsets,
+                    right_front_outer_offsets,
+                    left_front_inner_offsets,
+                    left_front_outer_offsets,
+                    right_back_inner_offsets,
+                    right_back_outer_offsets,
+                    left_back_inner_offsets,
+                    left_back_outer_offsets,
+                ]
+            )
+
+        offsets = [positive_offsets, negative_offsets]
+
+        for i, offset8 in enumerate(offsets):
+            if len(offset8) > 1:
+                rfi_series = []
+                rfo_series = []
+                lfi_series = []
+                lfo_series = []
+                rbi_series = []
+                rbo_series = []
+                lbi_series = []
+                lbo_series = []
+
+                if i == 0:
+                    df = pos_xte_df
+                elif i == 1:
+                    df = neg_xte_df
+
+                for index in range(int(len(offset8) / 8)):
+                    incr = index * 8
+                    right_front_inner_offset = chain_geospatial_offsets(
+                        "Center Fixed Axle",
+                        "Bottom Inner Right Front Tire",
+                        offset8[0 + incr],
+                    )
+                    right_front_outer_offset = chain_geospatial_offsets(
+                        "Center Fixed Axle",
+                        "Bottom Outer Right Front Tire",
+                        offset8[1 + incr],
+                    )
+                    left_front_inner_offset = chain_geospatial_offsets(
+                        "Center Fixed Axle",
+                        "Bottom Inner Left Front Tire",
+                        offset8[2 + incr],
+                    )
+                    left_front_outer_offset = chain_geospatial_offsets(
+                        "Center Fixed Axle",
+                        "Bottom Outer Left Front Tire",
+                        offset8[3 + incr],
+                    )
+
+                    right_back_inner_offset = chain_geospatial_offsets(
+                        "Center Fixed Axle",
+                        "Bottom Inner Right Back Tire",
+                        offset8[4 + incr],
+                    )
+                    right_back_outer_offset = chain_geospatial_offsets(
+                        "Center Fixed Axle",
+                        "Bottom Outer Right Back Tire",
+                        offset8[5 + incr],
+                    )
+                    left_back_inner_offset = chain_geospatial_offsets(
+                        "Center Fixed Axle",
+                        "Bottom Inner Left Back Tire",
+                        offset8[6 + incr],
+                    )
+                    left_back_outer_offset = chain_geospatial_offsets(
+                        "Center Fixed Axle",
+                        "Bottom Outer Left Back Tire",
+                        offset8[7 + incr],
+                    )
+
+                    rfi_series.append(
+                        apply_geospatial_offset(
+                            right_front_inner_offset, df.iloc[index : index + 1]
+                        )
+                    )
+                    rfo_series.append(
+                        apply_geospatial_offset(
+                            right_front_outer_offset, df.iloc[index : index + 1]
+                        )
+                    )
+                    lfi_series.append(
+                        apply_geospatial_offset(
+                            left_front_inner_offset, df.iloc[index : index + 1]
+                        )
+                    )
+                    lfo_series.append(
+                        apply_geospatial_offset(
+                            left_front_outer_offset, df.iloc[index : index + 1]
+                        )
+                    )
+
+                    rbi_series.append(
+                        apply_geospatial_offset(
+                            right_back_inner_offset, df.iloc[index : index + 1]
+                        )
+                    )
+                    rbo_series.append(
+                        apply_geospatial_offset(
+                            right_back_outer_offset, df.iloc[index : index + 1]
+                        )
+                    )
+                    lbi_series.append(
+                        apply_geospatial_offset(
+                            left_back_inner_offset, df.iloc[index : index + 1]
+                        )
+                    )
+                    lbo_series.append(
+                        apply_geospatial_offset(
+                            left_back_outer_offset, df.iloc[index : index + 1]
+                        )
+                    )
+
+                right_front_inner_offset_df = pd.concat(rfi_series)
+                right_front_outer_offset_df = pd.concat(rfo_series)
+                left_front_inner_offset_df = pd.concat(lfi_series)
+                left_front_outer_offset_df = pd.concat(lfo_series)
+
+                right_back_inner_offset_df = pd.concat(rbi_series)
+                right_back_outer_offset_df = pd.concat(rbo_series)
+                left_back_inner_offset_df = pd.concat(lbi_series)
+                left_back_outer_offset_df = pd.concat(lbo_series)
+
+                f_crushed = (
+                    abs(self.s_engagement_df["xte_m"] * 100)
+                    > self.xte_allowance
+                )
+
+                right_front = right_front_inner_offset_df.join(
+                    right_front_outer_offset_df,
+                    how="outer",
+                    lsuffix="_left",
+                    rsuffix="_right",
+                )
+                left_front = left_front_inner_offset_df.join(
+                    left_front_outer_offset_df,
+                    how="outer",
+                    lsuffix="_right",
+                    rsuffix="_left",
+                )
+                right_back = right_back_inner_offset_df.join(
+                    right_back_outer_offset_df,
+                    how="outer",
+                    lsuffix="_left",
+                    rsuffix="_right",
+                )
+                left_back = left_back_inner_offset_df.join(
+                    left_back_outer_offset_df,
+                    how="outer",
+                    lsuffix="_right",
+                    rsuffix="_left",
+                )
+
+                df_polygon_lists = [
+                    right_front,
+                    left_front,
+                    right_back,
+                    left_back,
+                ]
+
+                for points in df_polygon_lists:
+                    polygons = get_filtered_polygons(
+                        points, (f_crushed & self.f_gpssteering)
+                    )
+                    for polygon in polygons:
+                        if isinstance(polygon, MultiPolygon):
+                            for geom in polygon.geoms:
+                                add_patch(
+                                    figure_object=bg_graph,
+                                    geom=geom,
+                                    fill_color="red",
+                                    fill_alpha=1,
+                                    name="Crushed Crop",
+                                )
+                        elif isinstance(polygon, Polygon):
+                            add_patch(
+                                figure_object=bg_graph,
+                                geom=polygon,
+                                fill_color="red",
+                                fill_alpha=1,
+                                name="Crushed Crop",
+                            )
+
+                    tire_on_line_area_crushed += self._get_polygons_area(polygons)
+
+        return bg_graph, tire_on_line_area_crushed
+
+    def _plot_crushed_crop(self, df, bg_graph):
+        LOGGER.info("Creating crushed crop plot")
+        f = abs(stats.zscore(df["Latitude"])) < 5
+        f_crushed = abs((df["xte_m"] * 100)) > 5
+        latitude = df["Latitude"]
+        longitude = df["Longitude"]
+        name = "Crushed Crop"
+        bg_graph.add_line_series(
+            latitude=df["Latitude"][f],
+            longitude=df["Longitude"][f],
+            name="Trajectory",
+            color="white",
+            line_width=3,
+            alpha=0.5,
+		    center=True,
+        )
+        bg_graph.add_categorical_series(
+            latitude=latitude[f & f_crushed],
+            longitude=longitude[f & f_crushed],
+            color="red",
+            name=name,
+        )
+
+        return bg_graph
+
+    def _plot_geospatial_xte(
+        self,
+        latitude: pd.Series,
+        longitude: pd.Series,
+        azimuth: pd.Series,
+        color_data: pd.Series,
+        autoguidance: pd.Series,
+        width: int = 600,
+        height: int = 600,
+        nth_row: int = 1,
+        width_arrow: int = 10,
+        height_arrow: int = 10,
+        nth_row_arrow: int = 1000,
+        low: float = 90,
+        high: float = -90,
+    ) -> cb.BokehGeospatial:
+        """Plot cross track error data on auto guidance on the Google Earth map
+
+        Args:
+            latitude (:obj:`pd.Series`): latitude of the vehicle CGR
+            longitude (:obj:`pd.Series`): longitude of the vehicle CGR
+            azimuth: azimuth of the vehicle CGR, a.k.a. heading
+            color_data (:obj:`pd.Series`): categorical data of EORT
+            autoguidance: auto guidance engagement status
+            title (str): figure title
+            width (int): figure width
+            height (int): figure height
+            width_arrow: width of directional arrow
+            height_arrow: height of directional arrow
+            nth_row_arrow: visualize arrows at every nth row of data
+            nth_row: plot nth row of data
+            low (int, optional): minimum value for the colorbar
+            high (int, optional): maximum value for the colorbar
+        """
+        title = "Cross Track Error"
+        f_ag = autoguidance
+        bg = cb.BokehGeospatial(
+            title=title, width=width, height=height, colorbar="LINEAR_BGR"
+        )
+
+        bg.add_numerical_series(
+            latitude=latitude[f_ag],
+            longitude=longitude[f_ag],
+            color_data=(color_data[f_ag]),
+            name=title,
+            low=low,
+            high=high,
+            colorbar_title="Cross Track Error (in)",
+            nth_row=nth_row
+        )
+
+        # Add vehicle directions
+        bg.add_directional_arrows(
+            latitude=latitude,
+            longitude=longitude,
+            azimuth=azimuth,
+            name="Vehicle Direction",
+            width=width_arrow,
+            height=height_arrow,
+            nth_row=nth_row_arrow,
+        )
+
+        return bg
